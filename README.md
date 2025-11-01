@@ -1,5 +1,19 @@
 # Palo Alto Networks MAC to User-ID
 
+> ⚠️ **Disclaimer**  
+>  
+> This script is intended **for demonstration and educational purposes only**.  
+> Mapping users to IP addresses based solely on **static MAC-to-User associations** is **not a security measure** and **should never be used in production environments**.  
+>  
+> User-ID information obtained this way is inherently **unreliable**, as MAC addresses can be easily spoofed or reassigned.  
+>  
+> For production-grade deployments, always use **official, trusted identity sources** such as:  
+> • Directory-based User-ID (LDAP, Active Directory, etc.)  
+> • Terminal-Server-based User-ID (Port to User Mapping)
+> • GlobalProtect, Captive Portal, or other PAN-OS Authentication Integration  
+>  
+> Use this utility at your own risk and **only in isolated lab or test environments**.
+
 Bulk-register user-to-IP mappings on a **Palo Alto Networks firewall** using the XML API (`type=user-id`), based on users and MAC addresses defined in a YAML file.
 
 The script automatically:
