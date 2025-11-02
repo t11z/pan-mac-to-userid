@@ -29,8 +29,10 @@ Ideal for small-scale lab automation, proof-of-concepts, or environments where u
 ## ⚙️ Features
 
 - **YAML-based configuration** — simple and readable  
-- **Automatic ARP discovery** using system cache and `scapy`  
-- **Bulk XML UID message builder** for efficient firewall updates  
+- **Automatic ARP discovery** using system cache and `scapy`
+- **IPv6 neighbor discovery (NDP)** for dual-stack environments
+- **Bulk XML UID message builder** for efficient firewall updates
+- **Optional User-ID tags** with per-tag timeouts via `<register-user>` payloads
 - **Direct API integration** with `type=user-id`  
 - **Linux-only** (due to ARP scanning and interface enumeration)  
 - **Graceful fallback** if `scapy` is unavailable  
@@ -65,13 +67,42 @@ users:
     macs:
       - 00:11:22:33:44:55
       - 66:77:88:99:AA:BB
+    tags:
+      - tag01
+      - tag02: 0
+      - name: tag03
+        timeout: 3600
   - id: bob
     macs:
       - AA:BB:CC:DD:EE:FF
+    tags:
+      - developers
 ```
 
-Each entry may list one or more MAC addresses per user.  
+Each entry may list one or more MAC addresses per user.
 If a MAC address is not found in the ARP cache or scan results, it’s skipped with a log entry.
+Tags are optional. You can define them as simple strings or as mappings that specify an individual `timeout`.
+The script automatically sends matching `<register-user>` updates alongside `<login>` entries, e.g.:
+
+```xml
+<uid-message>
+  <type>update</type>
+  <payload>
+    <login>
+      <entry name="alice" ip="192.0.2.10"/>
+    </login>
+    <register-user>
+      <entry user="alice">
+        <tag>
+          <member>tag01</member>
+          <member timeout="0">tag02</member>
+          <member timeout="3600">tag03</member>
+        </tag>
+      </entry>
+    </register-user>
+  </payload>
+</uid-message>
+```
 
 ---
 
@@ -87,7 +118,7 @@ sudo ./user_mac_to_firewall_pan_os.py users.yaml \
 
 | Flag | Description |
 |------|--------------|
-| `--scan-timeout` | ARP scan timeout per network (default: 2 s) |
+| `--scan-timeout` | ARP/NDP scan timeout per network (default: 2 s) |
 | `--no-verify-ssl` | Disable SSL certificate verification |
 | `--domain` | Prefix usernames as `domain\username` |
 | `--entry-timeout` | Set an expiration timeout (seconds) for each login entry |
@@ -130,17 +161,17 @@ You’ll receive XML output with the `<key>` field, which you can reuse in this 
 
 ## 🧠 Internals
 
-1. **ARP Parsing:**  
-   Reads local ARP table via `arp -a`.
+1. **ARP & NDP Parsing:**
+   Reads local ARP table via `arp -a` and IPv6 neighbor cache via `ip -6 neigh`.
 
-2. **Network Discovery:**  
-   Enumerates directly connected IPv4 networks with `ip -4 addr show`.
+2. **Network Discovery:**
+   Enumerates directly connected IPv4 and IPv6 networks with `ip -4 addr show` / `ip -6 addr show`.
 
-3. **Optional Scanning:**  
-   Uses `scapy` ARP probes for live host discovery.
+3. **Optional Scanning:**
+   Uses `scapy` ARP (IPv4) and NDP (IPv6) probes for live host discovery on manageable prefixes.
 
-4. **Payload Builder:**  
-   Constructs `<uid-message>` according to PAN-OS documentation, e.g.:
+4. **Payload Builder:**
+   Constructs `<uid-message>` according to PAN-OS documentation, including `<login>` and optional `<register-user>` sections, e.g.:
 
    ```xml
    <uid-message>
@@ -148,11 +179,18 @@ You’ll receive XML output with the `<key>` field, which you can reuse in this 
      <type>update</type>
      <payload>
        <login>
-         <entry name="ACME\alice" ip="192.168.1.42" timeout="3600"/>
-       </login>
-     </payload>
-   </uid-message>
-   ```
+       <entry name="ACME\alice" ip="192.168.1.42" timeout="3600"/>
+     </login>
+     <register-user>
+       <entry user="ACME\alice">
+         <tag>
+           <member timeout="0">developer</member>
+         </tag>
+       </entry>
+     </register-user>
+   </payload>
+  </uid-message>
+  ```
 
 5. **Firewall API Call:**  
    Sends payload to `https://<firewall>/api/` with parameters:
