@@ -496,6 +496,35 @@ def main(yaml_path: str, api_url: str, api_key: str, scan_timeout: int = 2, veri
         logging.info("No mappings or tags to send; exiting")
         return 0
 
+    # Log the data that will be pushed before building the payload
+    user_to_ips: Dict[str, Set[str]] = defaultdict(set)
+    for user, ip in mappings:
+        user_to_ips[user].add(ip)
+
+    logging.info("Preparing to push the following User-ID information to the firewall:")
+
+    def format_user(name: str) -> str:
+        return f"{domain}\\{name}" if domain else name
+
+    if mappings:
+        for user, ips in sorted(user_to_ips.items()):
+            formatted_user = format_user(user)
+            ips_sorted = sorted(ips)
+            logging.info("  User %s -> IPs: %s", formatted_user, ", ".join(ips_sorted))
+
+    if has_tags:
+        for user, user_tags in sorted(tag_map.items()):
+            if not user_tags:
+                continue
+            formatted_user = format_user(user)
+            tag_descriptions = []
+            for tag_name, tag_timeout in user_tags:
+                if tag_timeout is None:
+                    tag_descriptions.append(tag_name)
+                else:
+                    tag_descriptions.append(f"{tag_name} (timeout={int(tag_timeout)})")
+            logging.info("  User %s -> Tags: %s", formatted_user, ", ".join(tag_descriptions))
+
     # build bulk payload (all login entries in one uid-message)
     payload = build_uid_payload(mappings, tag_map, timeout=entry_timeout, domain=domain)
     logging.debug("Built UID payload:\n%s", payload)
