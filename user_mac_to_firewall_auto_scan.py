@@ -3,16 +3,18 @@
 user_mac_to_firewall_pan_os.py
 
 Reads users and MAC addresses from a YAML file, finds IPs for those MACs
-(using local ARP cache and ARP-scans of directly connected IPv4 networks),
-builds a bulk PAN-OS uid-message payload (login entries) and posts it to
-the firewall XML API (type=user-id) according to the PAN-OS doc examples.
+(using local ARP cache and ARP-scans of directly connected IPv4 networks
+plus IPv6 NDP data/scans), builds a bulk PAN-OS uid-message payload
+(login and optional register-user tag entries) and posts it to the
+firewall XML API (type=user-id) according to the PAN-OS doc examples.
 
 Linux-only assumptions for interface enumeration: uses "ip -4 addr show".
 Requires root for ARP scanning with scapy.
 """
 
-from typing import Dict, List, Tuple
-from ipaddress import IPv4Network, ip_network, ip_address
+from typing import Dict, List, Tuple, Iterable, Set, Optional
+from ipaddress import IPv4Network, IPv6Network, ip_address
+from collections import defaultdict
 import subprocess
 import re
 import yaml
@@ -23,7 +25,18 @@ import requests
 
 # OPTIONAL: scapy for ARP scan
 try:
-    from scapy.all import srp, Ether, ARP, conf
+    from scapy.all import (
+        srp,
+        Ether,
+        ARP,
+        conf,
+        IPv6,
+        ICMPv6ND_NS,
+        ICMPv6ND_NA,
+        ICMPv6NDOptSrcLLAddr,
+        get_if_hwaddr,
+    )
+    from scapy.layers.inet6 import in6_getnsma, in6_getnsmac
     SCAPY_AVAILABLE = True
 except Exception:
     SCAPY_AVAILABLE = False
@@ -62,6 +75,30 @@ def parse_arp_cache() -> Dict[str, str]:
             ip = ip_match.group(1)
             mac = normalize_mac(mac_match.group(1))
             mac_to_ip[mac] = ip
+    return mac_to_ip
+
+
+def parse_ndp_cache() -> Dict[str, str]:
+    """Parse IPv6 neighbor cache into mac -> ipv6 mapping."""
+    mac_to_ip: Dict[str, str] = {}
+    try:
+        res = subprocess.check_output(
+            ["ip", "-6", "neigh", "show"], universal_newlines=True, stderr=subprocess.DEVNULL
+        )
+    except Exception as e:
+        logging.debug("ip -6 neigh not available: %s", e)
+        return mac_to_ip
+
+    for line in res.splitlines():
+        line = line.strip()
+        if not line or "lladdr" not in line:
+            continue
+        ip_match = re.match(r"([0-9a-fA-F:]+)\s+dev\s+\S+\s+lladdr\s+([0-9a-fA-F:-]{17})", line)
+        if not ip_match:
+            continue
+        ipv6 = ip_match.group(1)
+        mac = normalize_mac(ip_match.group(2))
+        mac_to_ip[mac] = ipv6
     return mac_to_ip
 
 
@@ -108,6 +145,47 @@ def get_directly_connected_ipv4_networks() -> List[Tuple[str, IPv4Network]]:
     return list(unique.values())
 
 
+def get_directly_connected_ipv6_networks() -> List[Tuple[str, IPv6Network]]:
+    """Enumerate directly connected IPv6 networks using 'ip -6 addr show'."""
+    networks: List[Tuple[str, IPv6Network]] = []
+    try:
+        out = subprocess.check_output(["ip", "-6", "addr", "show"], universal_newlines=True)
+    except Exception as e:
+        logging.error("Failed to run 'ip -6 addr show': %s", e)
+        return networks
+
+    iface = None
+    for line in out.splitlines():
+        m_iface = re.match(r"^\d+:\s+([^:]+):\s+<([^>]+)>", line)
+        if m_iface:
+            iface = m_iface.group(1)
+            continue
+        if iface is None:
+            continue
+        addr_match = re.search(r"inet6\s+([0-9a-fA-F:]+)/([0-9]{1,3})", line)
+        if addr_match:
+            ip_str = addr_match.group(1)
+            prefix = int(addr_match.group(2))
+            if iface == "lo":
+                continue
+            try:
+                net = IPv6Network(f"{ip_str}/{prefix}", strict=False)
+                if net.prefixlen == 128:
+                    continue
+                networks.append((iface, net))
+            except Exception as e:
+                logging.debug(
+                    "Skipping invalid IPv6 network for %s %s/%s: %s", iface, ip_str, prefix, e
+                )
+
+    unique: Dict[Tuple[str, int], Tuple[str, IPv6Network]] = {}
+    for iface, net in networks:
+        key = (str(net.network_address), net.prefixlen)
+        if key not in unique:
+            unique[key] = (iface, net)
+    return list(unique.values())
+
+
 def arp_scan_network(interface: str, network: IPv4Network, timeout: int = 2) -> Dict[str, str]:
     """
     ARP-scan the given IPv4 network on the given interface using scapy.
@@ -134,42 +212,158 @@ def arp_scan_network(interface: str, network: IPv4Network, timeout: int = 2) -> 
         return {}
 
 
-def find_ip_for_mac(mac: str, arp_cache: Dict[str, str], scan_cache: Dict[str, str]) -> str:
+def ndp_scan_network(
+    interface: str, network: IPv6Network, timeout: int = 2, max_hosts: int = 256
+) -> Dict[str, str]:
+    """Perform a basic IPv6 NDP scan on the given interface and network."""
+    results: Dict[str, str] = {}
+    if not SCAPY_AVAILABLE:
+        logging.debug("Scapy not available; skipping NDP scan for %s on %s", network, interface)
+        return results
+
+    # avoid attempting to iterate gigantic IPv6 networks
+    if network.num_addresses > max_hosts:
+        logging.debug(
+            "Skipping NDP scan for %s on %s due to large network size (%d hosts)",
+            network,
+            interface,
+            network.num_addresses,
+        )
+        return results
+
+    try:
+        conf.verb = 0
+        src_ll = get_if_hwaddr(interface)
+    except Exception as e:
+        logging.error("Failed to get hardware address for %s: %s", interface, e)
+        return results
+
+    try:
+        packets = []
+        for ip in network.hosts():
+            target = str(ip)
+            solicited_ip = in6_getnsma(target)
+            dst_mac = in6_getnsmac(target)
+            pkt = (
+                Ether(dst=dst_mac)
+                / IPv6(dst=solicited_ip)
+                / ICMPv6ND_NS(tgt=target)
+                / ICMPv6NDOptSrcLLAddr(lladdr=src_ll)
+            )
+            packets.append(pkt)
+
+        if not packets:
+            return results
+
+        answered_all = []
+        for pkt in packets:
+            answered, _ = srp(pkt, timeout=timeout, iface=interface, multi=True)
+            if answered:
+                answered_all.extend(answered)
+        for _, recv in answered_all:
+            if ICMPv6ND_NA not in recv:
+                continue
+            mac = normalize_mac(recv[Ether].src)
+            ip_addr = recv[IPv6].src
+            results[mac] = ip_addr
+        return results
+    except PermissionError:
+        logging.error("Root privileges required for NDP scanning with scapy on interface %s", interface)
+        return {}
+    except Exception as e:
+        logging.error("Error during NDP scan on %s (%s): %s", interface, network, e)
+        return {}
+
+
+def find_ips_for_mac(mac: str, mac_to_ips: Dict[str, Iterable[str]]) -> List[str]:
     macn = normalize_mac(mac)
-    if macn in arp_cache:
-        return arp_cache[macn]
-    if macn in scan_cache:
-        return scan_cache[macn]
-    return None
+    ips = mac_to_ips.get(macn)
+    if not ips:
+        return []
+    return sorted({ip for ip in ips if ip})
 
 
-def build_uid_login_payload(mappings: List[Tuple[str, str]], timeout: int = None, domain: str = None) -> str:
+def parse_user_tags(raw_tags: Iterable) -> List[Tuple[str, Optional[int]]]:
+    """Parse tag definitions from YAML into (name, timeout) tuples."""
+    parsed: List[Tuple[str, Optional[int]]] = []
+    if not raw_tags:
+        return parsed
+
+    for item in raw_tags:
+        name = None
+        timeout = None
+        if isinstance(item, str):
+            name = item
+        elif isinstance(item, dict):
+            if "name" in item:
+                name = item.get("name")
+                timeout = item.get("timeout")
+            elif len(item) == 1:
+                name, timeout = next(iter(item.items()))
+        if not name:
+            logging.warning("Skipping invalid tag definition: %s", item)
+            continue
+        if timeout is not None:
+            try:
+                timeout = int(timeout)
+            except (TypeError, ValueError):
+                logging.warning("Invalid timeout for tag %s: %s", name, timeout)
+                timeout = None
+        parsed.append((str(name), timeout))
+    return parsed
+
+
+def build_uid_payload(
+    mappings: List[Tuple[str, str]],
+    tags: Dict[str, List[Tuple[str, Optional[int]]]],
+    timeout: int = None,
+    domain: str = None,
+) -> str:
     """
-    Build a PAN-OS uid-message payload (bulk <login> entries).
+    Build a PAN-OS uid-message payload including <login> and optional <register-user> entries.
     mappings: list of (username, ip)
-    timeout: optional timeout attribute in seconds on each entry
+    tags: mapping of username -> [(tag, timeout)]
+    timeout: optional timeout attribute in seconds on each login entry
     domain: optional domain prefix to apply to each username as domain\\username
     Returns the XML string payload conforming to examples in PAN-OS doc.
     """
-    entries = []
+    login_entries: List[str] = []
     for user, ip in mappings:
         name = f"{domain}\\{user}" if domain else user
         timeout_attr = f' timeout="{int(timeout)}"' if timeout is not None else ""
-        entries.append(f'<entry name="{xml_escape(name)}" ip="{xml_escape(ip)}"{timeout_attr}/>')
+        login_entries.append(
+            f'<entry name="{xml_escape(name)}" ip="{xml_escape(ip)}"{timeout_attr}/>'
+        )
 
-    inner = "".join(entries)
-    payload = (
-        "<uid-message>"
-        "<version>1.0</version>"
-        "<type>update</type>"
-        "<payload>"
-        "<login>"
-        f"{inner}"
-        "</login>"
-        "</payload>"
-        "</uid-message>"
-    )
-    return payload
+    register_entries: List[str] = []
+    for user, user_tags in tags.items():
+        if not user_tags:
+            continue
+        name = f"{domain}\\{user}" if domain else user
+        members = []
+        for tag_name, tag_timeout in user_tags:
+            timeout_attr = f' timeout="{int(tag_timeout)}"' if tag_timeout is not None else ""
+            members.append(f'<member{timeout_attr}>{xml_escape(tag_name)}</member>')
+        if not members:
+            continue
+        register_entries.append(
+            '<entry user="{user}"><tag>{members}</tag></entry>'.format(
+                user=xml_escape(name), members="".join(members)
+            )
+        )
+
+    payload_parts = ["<uid-message>", "<version>1.0</version>", "<type>update</type>", "<payload>"]
+    if login_entries:
+        payload_parts.append("<login>")
+        payload_parts.append("".join(login_entries))
+        payload_parts.append("</login>")
+    if register_entries:
+        payload_parts.append("<register-user>")
+        payload_parts.append("".join(register_entries))
+        payload_parts.append("</register-user>")
+    payload_parts.append("</payload>")
+    payload_parts.append("</uid-message>")
+    return "".join(payload_parts)
 
 
 def xml_escape(text: str) -> str:
@@ -223,55 +417,116 @@ def main(yaml_path: str, api_url: str, api_key: str, scan_timeout: int = 2, veri
         logging.error("YAML file does not contain 'users' list")
         return 1
 
+    mac_to_ips: Dict[str, Set[str]] = defaultdict(set)
+
     arp_cache = parse_arp_cache()
     logging.info("Parsed ARP cache entries: %d", len(arp_cache))
+    for mac, ip in arp_cache.items():
+        mac_to_ips[mac].add(ip)
 
-    iface_nets = get_directly_connected_ipv4_networks()
-    if iface_nets:
-        logging.info("Discovered %d directly connected IPv4 networks", len(iface_nets))
+    ndp_cache = parse_ndp_cache()
+    logging.info("Parsed NDP cache entries: %d", len(ndp_cache))
+    for mac, ip in ndp_cache.items():
+        mac_to_ips[mac].add(ip)
+
+    iface_nets_v4 = get_directly_connected_ipv4_networks()
+    if iface_nets_v4:
+        logging.info("Discovered %d directly connected IPv4 networks", len(iface_nets_v4))
     else:
         logging.info("No directly connected IPv4 networks discovered; will rely on ARP cache only")
 
+    iface_nets_v6 = get_directly_connected_ipv6_networks()
+    if iface_nets_v6:
+        logging.info("Discovered %d directly connected IPv6 networks", len(iface_nets_v6))
+    else:
+        logging.info("No directly connected IPv6 networks discovered; will rely on NDP cache only")
+
     # aggregate scan results
-    scan_cache: Dict[str, str] = {}
-    for iface, net in iface_nets:
-        logging.info("Scanning network %s on interface %s", net, iface)
+    for iface, net in iface_nets_v4:
+        logging.info("Scanning IPv4 network %s on interface %s", net, iface)
         res = arp_scan_network(iface, net, timeout=scan_timeout)
         if res:
             logging.info("Found %d hosts in %s", len(res), net)
-            scan_cache.update(res)
+            for mac, ip in res.items():
+                mac_to_ips[mac].add(ip)
         else:
             logging.debug("No hosts discovered in scan on %s (%s)", iface, net)
+
+    for iface, net in iface_nets_v6:
+        logging.info("Scanning IPv6 network %s on interface %s", net, iface)
+        res = ndp_scan_network(iface, net, timeout=scan_timeout)
+        if res:
+            logging.info("Found %d IPv6 hosts in %s", len(res), net)
+            for mac, ip in res.items():
+                mac_to_ips[mac].add(ip)
+        else:
+            logging.debug("No IPv6 hosts discovered in scan on %s (%s)", iface, net)
 
     # build mappings list (username, ip) for all found IPs
     mappings: List[Tuple[str, str]] = []
     failures = []
+    tag_map: Dict[str, List[Tuple[str, Optional[int]]]] = {}
     for user in data["users"]:
         user_id = user.get("id")
         macs = user.get("macs", []) or []
         if not user_id:
             logging.warning("Skipping entry without id")
             continue
+        tags = parse_user_tags(user.get("tags"))
+        if tags:
+            tag_map.setdefault(user_id, []).extend(tags)
         for mac in macs:
-            ip = find_ip_for_mac(mac, arp_cache, scan_cache)
-            if not ip:
+            ips = find_ips_for_mac(mac, mac_to_ips)
+            if not ips:
                 logging.info("No IP found for MAC %s (user %s)", mac, user_id)
                 failures.append({"user": user_id, "mac": mac, "reason": "no-ip"})
                 continue
-            try:
-                ip_address(ip)  # validate
-            except Exception:
-                logging.warning("Invalid IP %s for MAC %s (user %s)", ip, mac, user_id)
-                failures.append({"user": user_id, "mac": mac, "ip": ip, "reason": "invalid-ip"})
-                continue
-            mappings.append((user_id, ip))
+            for ip in ips:
+                try:
+                    ip_address(ip)  # validate
+                except Exception:
+                    logging.warning("Invalid IP %s for MAC %s (user %s)", ip, mac, user_id)
+                    failures.append({"user": user_id, "mac": mac, "ip": ip, "reason": "invalid-ip"})
+                    continue
+                mappings.append((user_id, ip))
 
-    if not mappings:
-        logging.info("No mappings to send; exiting")
+    has_tags = any(tag_map.values())
+
+    if not mappings and not has_tags:
+        logging.info("No mappings or tags to send; exiting")
         return 0
 
+    # Log the data that will be pushed before building the payload
+    user_to_ips: Dict[str, Set[str]] = defaultdict(set)
+    for user, ip in mappings:
+        user_to_ips[user].add(ip)
+
+    logging.info("Preparing to push the following User-ID information to the firewall:")
+
+    def format_user(name: str) -> str:
+        return f"{domain}\\{name}" if domain else name
+
+    if mappings:
+        for user, ips in sorted(user_to_ips.items()):
+            formatted_user = format_user(user)
+            ips_sorted = sorted(ips)
+            logging.info("  User %s -> IPs: %s", formatted_user, ", ".join(ips_sorted))
+
+    if has_tags:
+        for user, user_tags in sorted(tag_map.items()):
+            if not user_tags:
+                continue
+            formatted_user = format_user(user)
+            tag_descriptions = []
+            for tag_name, tag_timeout in user_tags:
+                if tag_timeout is None:
+                    tag_descriptions.append(tag_name)
+                else:
+                    tag_descriptions.append(f"{tag_name} (timeout={int(tag_timeout)})")
+            logging.info("  User %s -> Tags: %s", formatted_user, ", ".join(tag_descriptions))
+
     # build bulk payload (all login entries in one uid-message)
-    payload = build_uid_login_payload(mappings, timeout=entry_timeout, domain=domain)
+    payload = build_uid_payload(mappings, tag_map, timeout=entry_timeout, domain=domain)
     logging.debug("Built UID payload:\n%s", payload)
 
     # ensure api_url ends with /api/
