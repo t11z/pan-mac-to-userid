@@ -38,6 +38,16 @@ def load_yaml(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def normalize_interface_name(name: str) -> str:
+    """Normalize interface identifiers from `ip addr` output."""
+
+    normalized = name.strip()
+    if "@" in normalized:
+        normalized = normalized.split("@", 1)[0]
+    normalized = normalized.rstrip(":")
+    return normalized
+
+
 def normalize_mac(mac: str) -> str:
     return mac.lower().replace("-", ":").replace(".", ":").replace(" ", "")
 
