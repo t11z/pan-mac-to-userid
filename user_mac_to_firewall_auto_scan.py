@@ -11,7 +11,7 @@ Linux-only assumptions for interface enumeration: uses "ip -4 addr show".
 Requires root for ARP scanning with scapy.
 """
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from ipaddress import IPv4Network, ip_network, ip_address
 import subprocess
 import re
@@ -143,33 +143,108 @@ def find_ip_for_mac(mac: str, arp_cache: Dict[str, str], scan_cache: Dict[str, s
     return None
 
 
-def build_uid_login_payload(mappings: List[Tuple[str, str]], timeout: int = None, domain: str = None) -> str:
+def build_uid_payload(
+    mappings: List[Tuple[str, str]],
+    user_tags: Dict[str, List[Tuple[str, Optional[int]]]],
+    timeout: int = None,
+    domain: str = None,
+) -> str:
     """
-    Build a PAN-OS uid-message payload (bulk <login> entries).
+    Build a PAN-OS uid-message payload including login and register-user entries.
     mappings: list of (username, ip)
-    timeout: optional timeout attribute in seconds on each entry
+    user_tags: mapping of username -> list of (tag, optional timeout)
+    timeout: optional timeout attribute in seconds on each login entry
     domain: optional domain prefix to apply to each username as domain\\username
-    Returns the XML string payload conforming to examples in PAN-OS doc.
+    Returns the XML string payload conforming to PAN-OS doc examples.
     """
-    entries = []
+
+    login_entries = []
     for user, ip in mappings:
         name = f"{domain}\\{user}" if domain else user
         timeout_attr = f' timeout="{int(timeout)}"' if timeout is not None else ""
-        entries.append(f'<entry name="{xml_escape(name)}" ip="{xml_escape(ip)}"{timeout_attr}/>')
+        login_entries.append(f'<entry name="{xml_escape(name)}" ip="{xml_escape(ip)}"{timeout_attr}/>')
 
-    inner = "".join(entries)
-    payload = (
-        "<uid-message>"
-        "<version>1.0</version>"
-        "<type>update</type>"
-        "<payload>"
-        "<login>"
-        f"{inner}"
-        "</login>"
-        "</payload>"
-        "</uid-message>"
-    )
-    return payload
+    register_entries = []
+    for user, tags in user_tags.items():
+        if not tags:
+            continue
+        name = f"{domain}\\{user}" if domain else user
+        tag_members = []
+        for tag, tag_timeout in tags:
+            timeout_attr = f' timeout="{int(tag_timeout)}"' if tag_timeout is not None else ""
+            tag_members.append(f'<member{timeout_attr}>{xml_escape(tag)}</member>')
+        register_entries.append(
+            f'<entry user="{xml_escape(name)}"><tag>{"".join(tag_members)}</tag></entry>'
+        )
+
+    payload_parts = [
+        "<uid-message>",
+        "<version>1.0</version>",
+        "<type>update</type>",
+        "<payload>",
+    ]
+
+    if login_entries:
+        payload_parts.append("<login>")
+        payload_parts.append("".join(login_entries))
+        payload_parts.append("</login>")
+
+    if register_entries:
+        payload_parts.append("<register-user>")
+        payload_parts.append("".join(register_entries))
+        payload_parts.append("</register-user>")
+
+    payload_parts.extend(["</payload>", "</uid-message>"])
+    return "".join(payload_parts)
+
+
+def parse_user_tags(raw_tags: List, user_id: str) -> List[Tuple[str, Optional[int]]]:
+    """Normalize YAML tag definitions into (name, timeout) tuples."""
+
+    normalized: List[Tuple[str, Optional[int]]] = []
+    for tag in raw_tags or []:
+        tag_name: Optional[str] = None
+        tag_timeout: Optional[int] = None
+
+        if isinstance(tag, str):
+            tag_name = tag
+        elif isinstance(tag, dict):
+            if "name" in tag:
+                tag_name = tag.get("name")
+                if "timeout" in tag:
+                    tag_timeout = _coerce_timeout(tag.get("timeout"), user_id, tag_name)
+            elif len(tag) == 1:
+                tag_name, timeout_value = next(iter(tag.items()))
+                tag_timeout = _coerce_timeout(timeout_value, user_id, tag_name)
+            else:
+                logging.warning("Skipping invalid tag definition for user %s: %s", user_id, tag)
+                continue
+        else:
+            logging.warning("Skipping invalid tag definition for user %s: %s", user_id, tag)
+            continue
+
+        if not tag_name:
+            logging.warning("Skipping tag with empty name for user %s", user_id)
+            continue
+
+        normalized.append((str(tag_name), tag_timeout))
+
+    return normalized
+
+
+def _coerce_timeout(value, user_id: str, tag_name: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        timeout_int = int(value)
+        if timeout_int < 0:
+            raise ValueError("timeout must be non-negative")
+        return timeout_int
+    except Exception:
+        logging.warning(
+            "Invalid timeout '%s' for tag %s (user %s); ignoring", value, tag_name, user_id
+        )
+        return None
 
 
 def xml_escape(text: str) -> str:
@@ -246,12 +321,16 @@ def main(yaml_path: str, api_url: str, api_key: str, scan_timeout: int = 2, veri
     # build mappings list (username, ip) for all found IPs
     mappings: List[Tuple[str, str]] = []
     failures = []
+    user_tags_map: Dict[str, List[Tuple[str, Optional[int]]]] = {}
     for user in data["users"]:
         user_id = user.get("id")
         macs = user.get("macs", []) or []
         if not user_id:
             logging.warning("Skipping entry without id")
             continue
+        tags = parse_user_tags(user.get("tags", []), user_id)
+        if tags:
+            user_tags_map[user_id] = tags
         for mac in macs:
             ip = find_ip_for_mac(mac, arp_cache, scan_cache)
             if not ip:
@@ -266,12 +345,17 @@ def main(yaml_path: str, api_url: str, api_key: str, scan_timeout: int = 2, veri
                 continue
             mappings.append((user_id, ip))
 
-    if not mappings:
-        logging.info("No mappings to send; exiting")
+    if not mappings and not any(user_tags_map.values()):
+        logging.info("No mappings or tags to send; exiting")
         return 0
 
     # build bulk payload (all login entries in one uid-message)
-    payload = build_uid_login_payload(mappings, timeout=entry_timeout, domain=domain)
+    payload = build_uid_payload(
+        mappings,
+        user_tags_map,
+        timeout=entry_timeout,
+        domain=domain,
+    )
     logging.debug("Built UID payload:\n%s", payload)
 
     # ensure api_url ends with /api/
