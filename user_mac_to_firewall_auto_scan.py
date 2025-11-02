@@ -42,14 +42,6 @@ def normalize_mac(mac: str) -> str:
     return mac.lower().replace("-", ":").replace(".", ":").replace(" ", "")
 
 
-def normalize_interface_name(name: str) -> str:
-    """Strip parent interface suffixes (e.g. veth0@if5 -> veth0)."""
-
-    if "@" in name:
-        return name.split("@", 1)[0]
-    return name
-
-
 def merge_mac_ip_map(target: Dict[str, List[str]], source: Dict[str, List[str]]) -> None:
     for mac, ips in source.items():
         macn = normalize_mac(mac)
@@ -105,8 +97,6 @@ def parse_ndp_cache() -> Dict[str, List[str]]:
             continue
         ip = parts[0]
         if "lladdr" not in parts:
-            continue
-        if "FAILED" in parts:
             continue
         try:
             mac_index = parts.index("lladdr") + 1
@@ -177,7 +167,7 @@ def get_ipv6_enabled_interfaces() -> List[str]:
         if m_iface:
             if iface and has_ipv6 and iface != "lo":
                 interfaces.append(iface)
-            iface = normalize_interface_name(m_iface.group(1))
+            iface = m_iface.group(1)
             has_ipv6 = False
             continue
         if iface is None:
