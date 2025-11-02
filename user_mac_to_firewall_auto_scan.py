@@ -125,7 +125,7 @@ def get_directly_connected_ipv4_networks() -> List[Tuple[str, IPv4Network]]:
     for line in out.splitlines():
         m_iface = re.match(r"^\d+:\s+([^:]+):\s+<([^>]+)>", line)
         if m_iface:
-            iface = m_iface.group(1)
+            iface = normalize_interface_name(m_iface.group(1))
             continue
         if iface is None:
             continue
