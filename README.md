@@ -65,13 +65,43 @@ users:
     macs:
       - 00:11:22:33:44:55
       - 66:77:88:99:AA:BB
+    tags:
+      - tag01
+      - tag02: 0
+      - name: tag03
+        timeout: 3600
   - id: bob
     macs:
       - AA:BB:CC:DD:EE:FF
+    tags:
+      - tag01
 ```
 
-Each entry may list one or more MAC addresses per user.  
+Each entry may list one or more MAC addresses per user.
 If a MAC address is not found in the ARP cache or scan results, it’s skipped with a log entry.
+
+Optional `tags` allow associating users with PAN-OS tags (and per-tag timeouts). The payload will include a `<register-user>`
+block alongside the login mappings, e.g.:
+
+```xml
+<uid-message>
+  <type>update</type>
+  <payload>
+    <login>
+      <entry name="alice" ip="192.0.2.10"/>
+    </login>
+    <register-user>
+      <entry user="alice">
+        <tag>
+          <member>tag01</member>
+          <member timeout="0">tag02</member>
+          <member timeout="3600">tag03</member>
+        </tag>
+      </entry>
+    </register-user>
+  </payload>
+</uid-message>
+```
 
 ---
 
